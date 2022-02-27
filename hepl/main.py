@@ -1,10 +1,14 @@
 #! /usr/bin/env python3
 import atexit
+import inspect
 import readline
 import shutil
 import tempfile
-from argparse import ArgumentParser
+from argparse import ArgumentParser, Namespace
+from functools import lru_cache
+from itertools import count
 from pathlib import Path
+from typing import NoReturn, Union
 
 from tableauhyperapi import (
     Connection,
@@ -12,6 +16,7 @@ from tableauhyperapi import (
     HyperProcess,
     Telemetry,
     CreateMode,
+    Result,
 )
 
 
@@ -19,41 +24,105 @@ class HeplException(Exception):
     pass
 
 
+# conform to the same interface as the results from the execute_query command
 class HeplResults(list):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
     def close(self):
         pass
 
 
-def handle_shortcut(conn: Connection, command: str) -> HeplResults:
-    command = command.strip()
+_dot_commands = {}
 
-    # TODO: implement proper parser
-    if command == ".schemas":
-        schemas = conn.catalog.get_schema_names()
-        return HeplResults([schema] for schema in schemas)
 
-    if command.startswith(".tables"):
-        args = command.split()[1:]
-        if not args:
-            schema = "public"
-        else:
-            schema = args[0]
-        tables = conn.catalog.get_table_names(schema)
-        return HeplResults([table] for table in tables)
+def dot_command(name: str):
+    def decorated(func):
+        _dot_commands[name] = func
+        return func
 
-    if command.startswith(".schema"):
-        table = command.split()[1]
-        table_def = conn.catalog.get_table_definition(table)
-        return HeplResults((c.name, c.type) for c in table_def.columns)
+    return decorated
 
-    if command == ".exit":
-        raise EOFError
 
-    if command == ".help":
-        return HeplResults([["TODO"]])
+@dot_command("schemas")
+def dot_schemas(conn: Connection):
+    return HeplResults(conn.catalog.get_schema_names())
 
-    else:
-        raise HeplException(f"Unknown command: {command}")
+
+@dot_command("tables")
+def dot_tables(conn: Connection, schema: str = "public"):
+    return HeplResults(conn.catalog.get_table_names(schema))
+
+
+@dot_command("schema")
+def dot_schema(conn: Connection, table: str):
+    table_def = conn.catalog.get_table_definition(table)
+    return HeplResults((c.name, c.type) for c in table_def.columns)
+
+
+@dot_command("exit")
+def dot_exit(_: Connection):
+    raise EOFError  # simulate ^D
+
+
+class DotCommandParserError(HeplException):
+    pass
+
+
+class DotCommandParser(ArgumentParser):
+    # TODO: customize usage and error messages
+
+    def error(self, message: str) -> NoReturn:
+        raise DotCommandParserError(message)
+
+
+@lru_cache(maxsize=None)
+def make_dot_command_parser():
+    parser = DotCommandParser(prog="", add_help=False, exit_on_error=False)
+    parser.set_defaults(func=None)
+    subparsers = parser.add_subparsers()
+
+    for name, func in sorted(_dot_commands.items()):
+        subparser = subparsers.add_parser(name, add_help=False, exit_on_error=False)
+
+        sig = inspect.signature(func)
+        parameters = list(sig.parameters.values())[1:]  # skip connection
+        for param in parameters:
+            kwargs = {}
+            if param.annotation != inspect.Parameter.empty:
+                kwargs["type"] = param.annotation
+            if param.default != inspect.Parameter.empty:
+                kwargs["default"] = param.default
+                kwargs["nargs"] = "?"
+
+            subparser.add_argument(param.name, **kwargs)
+
+        def dot_cmd(args: Namespace, conn: Connection):
+            formed_args = [getattr(args, p.name) for p in parameters]
+            return func(conn, *formed_args)
+
+        subparser.set_defaults(func=dot_cmd)
+
+    def dot_help_cmd(*_):
+        parser.print_help()
+        return HeplResults()
+
+    # add in help
+    help_parser = subparsers.add_parser("help")
+    help_parser.set_defaults(func=dot_help_cmd)
+
+    return parser
+
+
+def handle_dot_command(conn: Connection, command: str) -> HeplResults:
+    command = command.lstrip()[1:]  # remove leading whitespace and leading .
+
+    parser = make_dot_command_parser()
+    args = parser.parse_args(command.split())
+    return args.func(args, conn)
 
 
 def hepl_header(conn: Connection, database: Path):
@@ -64,20 +133,49 @@ def hepl_header(conn: Connection, database: Path):
     print(f"Connected to database: {database}")
 
 
+def show_results(results: Union[HeplResults, Result]):
+    col_sep, row_sep = "|", "\n"
+    for row in results:
+        print(col_sep.join(str(x) for x in row), end=row_sep)
+
+
+def get_results(conn: Connection, command: str) -> Union[HeplResults, Result]:
+    if command.startswith("."):
+        return handle_dot_command(conn, command)
+    return conn.execute_query(command)
+
+
+def get_command() -> str:
+    buffer = []
+
+    main_prompt = "hepl> "
+    continuation_prompt = " ...> "
+    for linenum in count():
+        prompt = main_prompt if linenum == 0 else continuation_prompt
+        line = input(prompt)
+        if not line:
+            break
+        buffer.append(line)
+
+        # no semicolons needed for dot commands
+        if linenum == 0 and line.lstrip().startswith("."):
+            break
+        # this could be better
+        if line.rstrip().endswith(";"):
+            break
+    return "\n".join(buffer)
+
+
 def hyper_repl(conn: Connection):
-    prompt = "hepl> "
     while True:
         try:
-            # TODO: this currently just runs the command but should really
-            #   wait until the end of a statement
-            command = input(prompt)
-            if command.startswith("."):
-                results = handle_shortcut(conn, command)
-            else:
-                results = conn.execute_query(command)
-            for row in results:
-                print("|".join(str(x) for x in row))
-            results.close()
+            command = get_command()
+            if not command:
+                continue
+
+            with get_results(conn, command) as results:
+                show_results(results)
+
         except (KeyboardInterrupt, EOFError):
             print()
             break

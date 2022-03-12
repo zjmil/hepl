@@ -36,12 +36,12 @@ class HeplResults(list):
         pass
 
 
-_dot_commands = {}
-
-
 def dot_command(name: str):
+    if getattr(dot_command, "commands", None) is None:
+        dot_command.commands = {}
+
     def decorated(func):
-        _dot_commands[name] = func
+        dot_command.commands[name] = func
         return func
 
     return decorated
@@ -49,12 +49,12 @@ def dot_command(name: str):
 
 @dot_command("schemas")
 def dot_schemas(conn: Connection):
-    return HeplResults(conn.catalog.get_schema_names())
+    return HeplResults((schema,) for schema in conn.catalog.get_schema_names())
 
 
 @dot_command("tables")
 def dot_tables(conn: Connection, schema: str = "public"):
-    return HeplResults(conn.catalog.get_table_names(schema))
+    return HeplResults((table,) for table in conn.catalog.get_table_names(schema))
 
 
 @dot_command("schema")
@@ -79,13 +79,22 @@ class DotCommandParser(ArgumentParser):
         raise DotCommandParserError(message)
 
 
+def make_dot_command(func, parameters):
+    def dot_cmd(args: Namespace, conn: Connection):
+        formed_args = [getattr(args, p.name) for p in parameters]
+        return func(conn, *formed_args)
+
+    return dot_cmd
+
+
 @lru_cache(maxsize=None)
 def make_dot_command_parser():
     parser = DotCommandParser(prog="", add_help=False, exit_on_error=False)
     parser.set_defaults(func=None)
     subparsers = parser.add_subparsers()
 
-    for name, func in sorted(_dot_commands.items()):
+    registered_commands = getattr(dot_command, "commands", {})
+    for name, func in sorted(registered_commands.items()):
         subparser = subparsers.add_parser(name, add_help=False, exit_on_error=False)
 
         sig = inspect.signature(func)
@@ -100,10 +109,7 @@ def make_dot_command_parser():
 
             subparser.add_argument(param.name, **kwargs)
 
-        def dot_cmd(args: Namespace, conn: Connection):
-            formed_args = [getattr(args, p.name) for p in parameters]
-            return func(conn, *formed_args)
-
+        dot_cmd = make_dot_command(func, parameters)
         subparser.set_defaults(func=dot_cmd)
 
     def dot_help_cmd(*_):
@@ -189,8 +195,9 @@ def parse_arguments():
     parser = ArgumentParser()
 
     parser.add_argument(
-        "database", type=Path, help="Path of the database file", nargs="?", default=None
+        "database", type=Path, help="Path of a Hyper database", nargs="?", default=None
     )
+    parser.add_argument("sql", nargs="?", help="Optional SQL to execute")
 
     args = parser.parse_args()
     return args

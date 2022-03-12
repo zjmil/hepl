@@ -12,11 +12,11 @@ from typing import NoReturn, Union
 
 from tableauhyperapi import (
     Connection,
+    CreateMode,
     HyperException,
     HyperProcess,
-    Telemetry,
-    CreateMode,
     Result,
+    Telemetry,
 )
 
 
@@ -233,9 +233,7 @@ def main():
         with HyperProcess(
             Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU, parameters=parameters
         ) as hyper:
-            with Connection(
-                hyper.endpoint, args.database, CreateMode.CREATE_IF_NOT_EXISTS
-            ) as conn:
+            with Connection(hyper.endpoint, args.database, CreateMode.CREATE_IF_NOT_EXISTS) as conn:
                 hepl_header(conn, args.database)
                 hyper_repl(conn)
     finally:
